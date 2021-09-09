@@ -1,4 +1,311 @@
+######################################
+# Kütüphanelerin import edilmesi
+#####################################
 
+import numpy as np
+import pandas as pd
+import gc
+import time
+from contextlib import contextmanager
+from lightgbm import LGBMClassifier
+from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.model_selection import KFold, StratifiedKFold
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+import re
+
+
+@contextmanager
+def timer(title):
+    t0 = time.time()
+    yield
+    print("{} - done in {:.0f}s".format(title, time.time() - t0))
+
+
+#######################
+# Fonksiyonlar
+#######################
+
+# veri setine genel bakış
+def check_df(dataframe):
+    print("##################### Shape #####################")
+    print(dataframe.shape)
+    print("##################### Types #####################")
+    print(dataframe.dtypes)
+
+
+# Değişkenlerin türlerinin belirlenmesi
+def grab_col_names(dataframe, cat_th=10, car_th=20):
+    # cat_cols, cat_but_car
+    cat_cols = [col for col in dataframe.columns if dataframe[col].dtypes == "O"]
+    num_but_cat = [col for col in dataframe.columns if dataframe[col].nunique() < cat_th and
+                   dataframe[col].dtypes != "O"]
+    cat_but_car = [col for col in dataframe.columns if dataframe[col].nunique() > car_th and
+                   dataframe[col].dtypes == "O"]
+    cat_cols = cat_cols + num_but_cat
+    cat_cols = [col for col in cat_cols if col not in cat_but_car]
+
+    # num_cols
+    num_cols = [col for col in dataframe.columns if dataframe[col].dtypes != "O"]
+    num_cols = [col for col in num_cols if col not in num_but_cat]
+
+    # print(f"Observations: {dataframe.shape[0]}")
+    # print(f"Variables: {dataframe.shape[1]}")
+    # print(f'cat_cols: {len(cat_cols)}')
+    # print(f'num_cols: {len(num_cols)}')
+    # print(f'cat_but_car: {len(cat_but_car)}')
+    # print(f'num_but_cat: {len(num_but_cat)}')
+    return cat_cols, num_cols, cat_but_car
+
+
+# Eksik gözlemler
+def missing_values_table(dataframe, na_name=False):
+    na_columns = [col for col in dataframe.columns if dataframe[col].isnull().sum() > 0]
+    n_miss = dataframe[na_columns].isnull().sum().sort_values(ascending=False)
+    ratio = (dataframe[na_columns].isnull().sum() / dataframe.shape[0] * 100).sort_values(ascending=False)
+    missing_df = pd.concat([n_miss, np.round(ratio, 2)], axis=1, keys=['n_miss', 'ratio'])
+    print(missing_df, end="\n")
+    if na_name:
+        return na_columns
+
+
+# Kategorik değişkenlerin incelenmesi
+def cat_summary(dataframe, col_name, plot=False):
+    print(pd.DataFrame({col_name: dataframe[col_name].value_counts(),
+                        "Ratio": 100 * dataframe[col_name].value_counts() / len(dataframe)}))
+    print("##########################################")
+    if plot:
+        plt.figure(figsize=(10, 5))
+        sns.countplot(x=dataframe[col_name], data=dataframe)
+        plt.show()
+
+
+# Nümerik değişkenlerin incelenmesi
+def num_summary(dataframe, numerical_col, plot=False):
+    quantiles = [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.99]
+    print(dataframe[numerical_col].describe(quantiles).T)
+    if plot:
+        dataframe[numerical_col].hist(bins=20)
+        plt.xlabel(numerical_col)
+        plt.title(numerical_col)
+        plt.show()
+
+
+# Korelasyonlar
+def high_correlation(data, remove=['SK_ID_CURR', 'SK_ID_BUREAU'], corr_coef="pearson", corr_value=0.7):
+    if len(remove) > 0:
+        cols = [x for x in data.columns if (x not in remove)]
+        c = data[cols].corr(method=corr_coef)
+    else:
+        c = data.corr(method=corr_coef)
+
+    for i in c.columns:
+        cr = c.loc[i].loc[(c.loc[i] >= corr_value) | (c.loc[i] <= -corr_value)].drop(i)
+        if len(cr) > 0:
+            print(i)
+            print("-------------------------------")
+            print(cr.sort_values(ascending=False))
+            print("\n")
+
+
+# Rare Encoding
+def rare_encoder(dataframe, rare_perc, cat_cols):
+    rare_columns = [col for col in cat_cols if
+                    (dataframe[col].value_counts() / len(dataframe) < rare_perc).sum() > 1]
+
+    for col in rare_columns:
+        tmp = dataframe[col].value_counts() / len(dataframe)
+        rare_labels = tmp[tmp < rare_perc].index
+        dataframe[col] = np.where(dataframe[col].isin(rare_labels), 'Rare', dataframe[col])
+
+    return dataframe
+
+
+# One-hot Encoding
+def one_hot_encoder(df, nan_as_category=True):
+    original_columns = list(df.columns)
+    categorical_columns = [col for col in df.columns if df[col].dtype == 'object']
+    df = pd.get_dummies(df, columns=categorical_columns, dummy_na=nan_as_category)
+    new_columns = [c for c in df.columns if c not in original_columns]
+    return df, new_columns
+
+
+#########################
+# Application_train_test
+#########################
+
+def application_train_test(num_rows=None, nan_as_category=False):
+    # Veri setinin okutulması
+    df = pd.read_csv('../input/home-credit-default-risk/application_train.csv', nrows=num_rows)
+    test_df = pd.read_csv('../input/home-credit-default-risk/application_test.csv', nrows=num_rows)
+    print("Train samples: {}, test samples: {}".format(len(df), len(test_df)))
+    df = df.append(test_df).reset_index()
+
+    # Cinsiyeti belirtilmeyen 4 kişi var bunları çıkarıyoruz.
+    df = df[df['CODE_GENDER'] != 'XNA']
+    # Medeni durumu unknown olan 1 kişi var bunu dropladık.
+    df = df[df['NAME_FAMILY_STATUS'] != "Unknown"]
+    # NaN values for DAYS_EMPLOYED: 365243 -> nan
+    df['DAYS_EMPLOYED'].replace(365243, np.nan, inplace=True)
+
+    ########
+    # RARE
+    ########
+    # NAME_INCOME_TYPE değişkeninin 4 sınıfının frekansı diğerlerine göre düşük olduğunu gözlemledik.
+    # Bu nedenle bu 4 sınıfı kendilerine en yakın olabilecek sınıfın için dahil ettik.
+    # Yani rare sınıfını diğerlerine eklemiş olduk.
+    df.loc[df['NAME_INCOME_TYPE'] == 'Businessman', 'NAME_INCOME_TYPE'] = 'Commercial associate'
+    df.loc[df['NAME_INCOME_TYPE'] == 'Maternity leave', 'NAME_INCOME_TYPE'] = 'Pensioner'
+    df.loc[df['NAME_INCOME_TYPE'] == 'Student', 'NAME_INCOME_TYPE'] = 'State servant'
+    df.loc[df['NAME_INCOME_TYPE'] == 'Unemployed', 'NAME_INCOME_TYPE'] = 'Pensioner'
+
+    # ORGANIZATION_TYPE
+    df["ORGANIZATION_TYPE"] = np.where(df["ORGANIZATION_TYPE"].str.contains("Business Entity"),
+                                       "Business_Entity", df["ORGANIZATION_TYPE"])
+    df["ORGANIZATION_TYPE"] = np.where(df["ORGANIZATION_TYPE"].str.contains("Industry"),
+                                       "Industry", df["ORGANIZATION_TYPE"])
+    df["ORGANIZATION_TYPE"] = np.where(df["ORGANIZATION_TYPE"].str.contains("Trade"),
+                                       "Trade", df["ORGANIZATION_TYPE"])
+    df["ORGANIZATION_TYPE"] = np.where(df["ORGANIZATION_TYPE"].str.contains("Transport"),
+                                       "Transport", df["ORGANIZATION_TYPE"])
+    df["ORGANIZATION_TYPE"] = np.where(df["ORGANIZATION_TYPE"].isin(["School", "Kindergarten", "University"]),
+                                       "Education", df["ORGANIZATION_TYPE"])
+    df["ORGANIZATION_TYPE"] = np.where(df["ORGANIZATION_TYPE"].isin(
+        ["Emergency", "Police", "Medicine", "Goverment", "Postal", "Military", "Security Ministries",
+         "Legal Services"]), "Official", df["ORGANIZATION_TYPE"])
+    df["ORGANIZATION_TYPE"] = np.where(df["ORGANIZATION_TYPE"].isin(["Bank", "Insurance"]),
+                                       "Finance", df["ORGANIZATION_TYPE"])
+    df["ORGANIZATION_TYPE"] = np.where(df["ORGANIZATION_TYPE"].str.contains("Goverment"),
+                                       "Government", df["ORGANIZATION_TYPE"])
+    df["ORGANIZATION_TYPE"] = np.where(df["ORGANIZATION_TYPE"].isin(["Realtor", "Housing"]), "Realty",
+                                       df["ORGANIZATION_TYPE"])
+    df["ORGANIZATION_TYPE"] = np.where(df["ORGANIZATION_TYPE"].isin(["Hotel", "Restaurant", "Services"]),
+                                       "TourismFoodSector", df["ORGANIZATION_TYPE"])
+    df["ORGANIZATION_TYPE"] = np.where(df["ORGANIZATION_TYPE"].isin(
+        ["Cleaning", "Electricity", "Telecom", "Mobile", "Advertising", "Religion", "Culture"]), "Other",
+                                       df["ORGANIZATION_TYPE"])
+
+    # OCCUPATION_TYPE
+    df["OCCUPATION_TYPE"] = np.where(df["OCCUPATION_TYPE"].isin(
+        ["Low-skill Laborers", "Cooking staff", "Security staff", "Private service staff", "Cleaning staff",
+         "Waiters/barmen staff"]), "Low_skill_staff", df["OCCUPATION_TYPE"])
+    df["OCCUPATION_TYPE"] = np.where(df["OCCUPATION_TYPE"].isin(["IT staff", "High skill tech staff"]),
+                                     "High_skill_staff", df["OCCUPATION_TYPE"])
+    df["OCCUPATION_TYPE"] = np.where(df["OCCUPATION_TYPE"].isin(["Secretaries", "HR staff", "Realty agents"]), "Others",
+                                     df["OCCUPATION_TYPE"])
+
+    # NAME_TYPE_SUITE
+    rare_list = ["NAME_TYPE_SUITE"]
+    rare_encoder(df, 0.01, rare_list)
+
+    # NAME_EDUCATION_TYPE
+    # Akademik derecenin frekansı az olduğu için bununla yüksek eğitimi aynı sınıfa aldık.
+    df["NAME_EDUCATION_TYPE"] = np.where(df["NAME_EDUCATION_TYPE"] == "Academic degree",
+                                         "Higher education", df["NAME_EDUCATION_TYPE"])
+
+    df["NAME_EDUCATION_TYPE"] = np.where(df["NAME_EDUCATION_TYPE"].str.contains("Secondary / secondary special"),
+                                         "Secondary_secondary_special", df["ORGANIZATION_TYPE"])
+
+    # NAME_FAMILY_STATUS
+    df["NAME_FAMILY_STATUS"] = np.where(df["NAME_FAMILY_STATUS"].str.contains("Single / not married"),
+                                        "Single_not_married", df["NAME_FAMILY_STATUS"])
+
+    # NAME_HOUSING_TYPE
+    df["NAME_HOUSING_TYPE"] = np.where(df["NAME_HOUSING_TYPE"].str.contains("House / apartment"),
+                                       "House_apartment", df["NAME_HOUSING_TYPE"])
+
+    # NAME_TYPE_SUITE
+    df["NAME_TYPE_SUITE"] = np.where(df["NAME_TYPE_SUITE"].str.contains("Spouse, partner"),
+                                     "Spouse_partner", df["NAME_TYPE_SUITE"])
+
+    # NAME_CONTRACT_TYPE
+    # Kategorik olan ama cinsiyet gibi 0 ve 1 olarak kodlanacak değişkenlere binary encode yaptık.
+    for bin_feature in ["NAME_CONTRACT_TYPE", 'CODE_GENDER', 'FLAG_OWN_CAR', 'FLAG_OWN_REALTY']:
+        df[bin_feature], uniques = pd.factorize(df[bin_feature])
+
+    # WEEKDAY_APPR_PROCESS_START
+    # Gün isimlerini 1,2,3....,7 olarak değiştireceğiz.
+    # Daha sonra günler döngüsel yapıda oldukları için bunlara cycle encode uygulayacağız.
+    # Asıl değişkenleri silmedik feature importance da bak!
+    weekday_dict = {'MONDAY': 1, 'TUESDAY': 2, 'WEDNESDAY': 3, 'THURSDAY': 4, 'FRIDAY': 5, 'SATURDAY': 6, 'SUNDAY': 7}
+    df.replace({'WEEKDAY_APPR_PROCESS_START': weekday_dict}, inplace=True)
+    # Cycle encode
+    df['NEW_WEEKDAY_APPR_PROCESS_START' + "_SIN"] = np.sin(2 * np.pi * df["WEEKDAY_APPR_PROCESS_START"] / 7)
+    df["NEW_WEEKDAY_APPR_PROCESS_START" + "_COS"] = np.cos(2 * np.pi * df["WEEKDAY_APPR_PROCESS_START"] / 7)
+
+    # HOUR_APPR_PROCESS_START
+    # değişken müşterinin hangi saatte başvurduğu bilgisini veriyordu.
+    # Saat bilgisi de yine döngüsel olduğu için buna da cycle encode yapıyoruz.
+    df['NEW_HOUR_APPR_PROCESS_START' + "_SIN"] = np.sin(2 * np.pi * df["HOUR_APPR_PROCESS_START"] / 23)
+    df["NEW_HOUR_APPR_PROCESS_START" + "_COS"] = np.cos(2 * np.pi * df["HOUR_APPR_PROCESS_START"] / 23)
+
+    ###########
+    # DROP
+    ###########
+    # FLAG_MOBIL ve FLAG_CONT_MOBILE değişkenlerinde iki alt sınıfı var ve birinin frekansı çok az.
+    # Yani bilgi taşımayan değişken bu nedenle drop ediyoruz.
+    drop_cols = ["FONDKAPREMONT_MODE", "WALLSMATERIAL_MODE", "HOUSETYPE_MODE",
+                 "EMERGENCYSTATE_MODE", "FLAG_MOBIL", "FLAG_EMP_PHONE", "FLAG_WORK_PHONE", "FLAG_CONT_MOBILE",
+                 "FLAG_PHONE", "FLAG_EMAIL"]
+    df.drop(drop_cols, axis=1, inplace=True)
+
+    # OBS_30_CNT_SOCIAL_CIRCLE,OBS_60_CNT_SOCIAL_CIRCLE
+    df.drop(['OBS_30_CNT_SOCIAL_CIRCLE', 'OBS_60_CNT_SOCIAL_CIRCLE'], axis=1, inplace=True)
+
+    # REGION
+    # Bu değişkenler bölge ve şehir bazında ayrı ayrı puan veriyordu
+    # Biz bunları toplayarak tek bir değişken elde ettik ve diğerlerini dropladık.
+    cols = ["REG_REGION_NOT_LIVE_REGION", "REG_REGION_NOT_WORK_REGION", "LIVE_REGION_NOT_WORK_REGION",
+            "REG_CITY_NOT_LIVE_CITY", "REG_CITY_NOT_WORK_CITY", "LIVE_CITY_NOT_WORK_CITY"]
+    df["NEW_REGION"] = df[cols].sum(axis=1)
+    df.drop(cols, axis=1, inplace=True)
+
+    # Flag_DOCUMENT
+    # Bu değişkenler her dökümanın ayrı ayrı verilip verilmediği bilgisini veriyordu.
+    # Biz bunları toplayarak tek bir değişken elde ettik,yani totalde verilen belge sayısını hesapladık
+    # ve diğerlerini dropladık.
+    docs = [col for col in df.columns if 'FLAG_DOC' in col]
+    df['NEW_DOCUMENT'] = df[docs].sum(axis=1)
+    df.drop(docs, axis=1, inplace=True)
+
+    ##########################
+    # FEATURE ENGINEERING
+    ##########################
+    # 1. Müşteri başvurudan ne kadar önce işe başladı(gün) / müşterinin yaşı(gün)
+    df['NEW_DAYS_EMPLOYED_RATIO'] = df['DAYS_EMPLOYED'] / df['DAYS_BIRTH']
+
+    # 2. Müşterinin toplam geliri / kredi tutarı
+    df['NEW_INCOME_CREDIT_RATIO'] = df['AMT_INCOME_TOTAL'] / df['AMT_CREDIT']
+
+    # 3. Müşterinin toplam geliri / aile üyesi süresi
+    # Ailede kişi başına ne kadar gelir var bunu ortaya çıkarıyor.
+    df['NEW_INCOME_PER_RATIO'] = df['AMT_INCOME_TOTAL'] / df['CNT_FAM_MEMBERS']
+
+    # 4. Kredinin yıllık ödemesi / Müşterinin geliri
+    # Eğer bu değer 0-1 arasındaysa iyi yani geliri kredi ödemesinden fazla
+    # Eğer bu değer 1 ise kötü yani geliri kredi ödemesinden daha az.
+    df['NEW_ANNUITY_INCOME_RATIO'] = df['AMT_ANNUITY'] / df['AMT_INCOME_TOTAL']
+
+    # 5. Kredinin yıllık ödemesi / kredi tutarı
+    df['NEW_PAYMENT_RATIO'] = df['AMT_ANNUITY'] / df['AMT_CREDIT']
+
+    # 6. EXT_SOURCE değişkenleri dışarıdan alınan puanlardı.Ortalamaları ile yeni bir değişken oluşturduk.
+    df["NEW_EXTSOURCE_MEAN"] = df[['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3']].mean(axis=1)
+
+    # 7. Bu değişkenleri çarparak ağırlıklı yeni bir değişken oluşturduk.
+    df['NEW_EXTSOURCES_WPOINT'] = df['EXT_SOURCE_1'] * df['EXT_SOURCE_2'] * df['EXT_SOURCE_3']
+
+    # 8. Kredi ile satın alınacak malların fiyatı / toplam kredi tutarı
+    # Bu oran 0-1 arasında ise müşterinin alacağı mal fiyatından daha fazla kredi çekmesi demek.
+    # Bu oranın 1 olması demek müşterinin ihtiyacı kadar kredi çektiği anlamına gelir.
+    # Bu oran 1 den büykse müşteri ihtiyacından daha az kredi çekmiş demektir.
+    df["NEW_GOODS_CREDIT_RATIO"] = df["AMT_GOODS_PRICE"] / df["AMT_CREDIT"]
+
+    # 9.Yukarıdaki değişkenle bağlantılı olarak:
+    # Bu fark 0 dan büyükse ihtiyacından az kredi çekmiş
     # 0 olursa ihtiyacı kadar çekmiş
     # 0 dan küçükse ihtiyacından fazla çekmiş
     df["NEW_GOODS_CREDIT_DIFF"] = df["AMT_GOODS_PRICE"] - df["AMT_CREDIT"]
